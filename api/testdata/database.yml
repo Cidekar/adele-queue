@@ -1,0 +1,9 @@
+---
+development:
+  dialect: postgres
+  database: test
+  user: postgres
+  password: password
+  host: localhost
+  port: 5432
+  pool: 5

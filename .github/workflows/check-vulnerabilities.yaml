@@ -1,0 +1,155 @@
+name: check for vulnerabilities
+
+env:
+  GOTOOLCHAIN: auto
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - main
+      - development
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner type'
+        required: false
+        default: 'github-hosted'
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+  repository_dispatch:
+    types: [security-scan]
+
+jobs:
+  security-scan:
+    runs-on: ${{ github.event.inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64", "cidekar", "macos-arm64"]') || 'ubuntu-latest' }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+
+    steps:
+      - name: install github cli
+        if: runner.os == 'macOS'
+        run: |
+          if command -v gh &> /dev/null; then
+            echo "GitHub CLI already available: $(gh --version)"
+            exit 0
+          fi
+          brew install gh
+
+      - name: setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: generate dependency list
+        run: |
+          go list -json -deps ./... > go.list
+          DEP_COUNT=$(go list -deps ./... | wc -l | tr -d ' ')
+          MODULE_COUNT=$(go list -m all | wc -l | tr -d ' ')
+          DIRECT_DEPS=$(go list -m -f '{{if not .Main}}{{.Path}}{{end}}' all | wc -l | tr -d ' ')
+          echo "DEPENDENCY_COUNT=$DEP_COUNT" >> $GITHUB_ENV
+          echo "MODULE_COUNT=$MODULE_COUNT" >> $GITHUB_ENV
+          echo "DIRECT_DEPS=$DIRECT_DEPS" >> $GITHUB_ENV
+
+      - name: install nancy
+        run: go install github.com/sonatype-nexus-community/nancy@latest
+
+      - name: run nancy scan
+        id: nancy
+        env:
+          OSS_INDEX_USERNAME: ${{ secrets.OSS_INDEX_USERNAME }}
+          OSS_INDEX_TOKEN: ${{ secrets.OSS_INDEX_TOKEN }}
+        run: |
+          set +e
+          go list -json -deps ./... | nancy sleuth \
+            --username "$OSS_INDEX_USERNAME" \
+            --token "$OSS_INDEX_TOKEN" \
+            --exclude-vulnerability-file .nancy-ignore \
+            --output text \
+            --loud > nancy-detailed.txt 2>&1
+          NANCY_EXIT=$?
+          set -e
+
+          if [ $NANCY_EXIT -eq 0 ]; then
+            echo "SCAN_STATUS=success" >> $GITHUB_ENV
+          else
+            echo "SCAN_STATUS=failure" >> $GITHUB_ENV
+          fi
+
+      - name: generate report
+        run: |
+          {
+            echo "## Security Scan Report"
+            echo ""
+            echo "| Metric | Count |"
+            echo "|--------|-------|"
+            echo "| Total dependencies | $DEPENDENCY_COUNT |"
+            echo "| Go modules | $MODULE_COUNT |"
+            echo "| Direct dependencies | $DIRECT_DEPS |"
+            echo ""
+            if [ "$SCAN_STATUS" = "success" ]; then
+              echo "### Result: PASSED"
+              echo "No known vulnerabilities found."
+            else
+              echo "### Result: FAILED"
+              echo "Vulnerabilities detected. See details below."
+              echo ""
+              echo "<details><summary>Nancy scan output</summary>"
+              echo ""
+              echo '```'
+              cat nancy-detailed.txt
+              echo '```'
+              echo "</details>"
+            fi
+          } > nancy-report.md
+
+      - name: upload scan report
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: nancy-security-report
+          path: |
+            nancy-report.md
+            nancy-detailed.txt
+          retention-days: 30
+
+      - name: comment on pr
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          COMMENT_MARKER="<!-- nancy-security-scan -->"
+          BODY="${COMMENT_MARKER}
+          $(cat nancy-report.md)"
+
+          EXISTING=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+            --jq ".[] | select(.body | contains(\"${COMMENT_MARKER}\")) | .id" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh api repos/${{ github.repository }}/issues/comments/${EXISTING} \
+              --method PATCH --field body="$BODY"
+          else
+            gh pr comment ${PR_NUMBER} --body "$BODY"
+          fi
+
+      - name: set job status
+        run: |
+          if [ "$SCAN_STATUS" = "success" ]; then
+            exit 0
+          else
+            exit 1
+          fi

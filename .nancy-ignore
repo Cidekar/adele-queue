@@ -1,0 +1,4 @@
+# github.com/jackc/pgx/v5@v5.9.1 — CVE-2026-33815 (CVSS 9.8, memory-safety)
+# No patched version available upstream as of 2026-04-17. We are on the latest release (v5.9.1).
+# Transitive dependency via upper/db. Monitor https://github.com/jackc/pgx for a fix.
+CVE-2026-33815

@@ -1,0 +1,70 @@
+name: create release workflow
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner type'
+        required: false
+        default: 'github-hosted'
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+
+jobs:
+  release:
+    runs-on: ${{ github.event.inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64", "cidekar", "macos-arm64"]') || 'ubuntu-latest' }}
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: validate release pr
+        id: check_release
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          RC_PATTERN="Auto Release PR: (v?[0-9]+\.[0-9]+\.[0-9]+)(-rc(\.[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?)"
+
+          if [[ "$PR_TITLE" =~ $RC_PATTERN ]]; then
+            BASE_VERSION="${BASH_REMATCH[1]}"
+            RC_TAG="${BASE_VERSION}${BASH_REMATCH[2]}"
+
+            echo "is_release_pr=true" >> $GITHUB_OUTPUT
+            echo "rc_tag=$RC_TAG" >> $GITHUB_OUTPUT
+            echo "clean_tag=$BASE_VERSION" >> $GITHUB_OUTPUT
+            echo "Detected release PR: RC=$RC_TAG, Clean=$BASE_VERSION"
+          else
+            echo "is_release_pr=false" >> $GITHUB_OUTPUT
+            echo "Not a release PR, skipping."
+          fi
+
+      - name: checkout
+        if: steps.check_release.outputs.is_release_pr == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: create clean release tag
+        if: steps.check_release.outputs.is_release_pr == 'true'
+        env:
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin $BASE_BRANCH
+          git checkout $BASE_BRANCH
+          git pull origin $BASE_BRANCH
+          git tag ${{ steps.check_release.outputs.clean_tag }}
+          git push origin ${{ steps.check_release.outputs.clean_tag }}
+
+      - name: create github release
+        if: steps.check_release.outputs.is_release_pr == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ steps.check_release.outputs.clean_tag }} \
+            --title "${{ steps.check_release.outputs.clean_tag }}" \
+            --generate-notes \
+            --latest

@@ -1,0 +1,10 @@
+Backend: memory
+WorkerCount: 1
+MaxAttempts: 3
+HighWaterMark: 10000
+QueueChannels:
+  - job
+QueueChannelDefault: job
+Debug: false
+RedisPrefix: ""
+RedisScanInterval: 1

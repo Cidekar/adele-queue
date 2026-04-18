@@ -1,0 +1,25 @@
+{
+    "version": "0.2",
+    "ignorePaths": [],
+    "dictionaryDefinitions": [],
+    "dictionaries": [],
+    "words": [
+        "Atoi",
+        "badger",
+        "godotenv",
+        "goroutine",
+        "Println",
+        "redigo",
+        "redis",
+        "scs",
+        "Sprintf",
+        "strconv",
+        "upper"
+    ],
+    "ignoreWords": [
+        "Mzmy",
+        "Qibvm",
+        "abcdefghabcdefghijklmnopqrstuvwxyz"
+    ],
+    "import": []
+}

@@ -1,0 +1,124 @@
+name: pull request internal workflow
+
+env:
+  BASE_BRANCH: main
+  GOTOOLCHAIN: auto
+
+on:
+  push:
+    tags:
+      - '*-rc'
+      - '*-rc.*'
+      - '*-rc+*'
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner type'
+        required: false
+        default: 'github-hosted'
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+      tag:
+        description: 'Tag to release (e.g. v1.0.0-rc)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ${{ github.event.inputs.runner == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64", "cidekar", "macos-arm64"]') || 'ubuntu-latest' }}
+    steps:
+      - name: install github cli
+        if: runner.os == 'macOS'
+        run: |
+          if command -v gh &> /dev/null; then
+            echo "GitHub CLI already available: $(gh --version)"
+            exit 0
+          fi
+          brew install gh
+
+      - name: setup go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: download dependencies
+        run: go mod download
+
+      - name: build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: extract version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: create release branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b release/${{ steps.version.outputs.VERSION }}
+          git commit --allow-empty -m "chore: release ${{ steps.version.outputs.VERSION }}"
+          git push origin release/${{ steps.version.outputs.VERSION }}
+
+      - name: sync with base branch
+        id: sync_main
+        run: |
+          git fetch origin $BASE_BRANCH
+          BEHIND_COUNT=$(git rev-list --count HEAD..origin/$BASE_BRANCH)
+          if [ "$BEHIND_COUNT" -gt 0 ]; then
+            echo "Branch is $BEHIND_COUNT commits behind $BASE_BRANCH, merging..."
+            git merge origin/$BASE_BRANCH --no-edit || {
+              echo "merge_successful=false" >> $GITHUB_OUTPUT
+              echo "Merge conflict detected"
+              exit 1
+            }
+            git push origin release/${{ steps.version.outputs.VERSION }}
+          fi
+          echo "merge_successful=true" >> $GITHUB_OUTPUT
+
+      - name: create pr
+        id: create-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_URL=$(gh pr create \
+            --title "Auto Release PR: ${{ steps.version.outputs.VERSION }}" \
+            --body "## Release ${{ steps.version.outputs.VERSION }}
+
+          Automated release PR created from tag \`${{ steps.version.outputs.VERSION }}\`.
+
+          ### Checklist
+          - [ ] Security scan passed
+          - [ ] Build and vet passed
+          - [ ] Ready for release" \
+            --head "release/${{ steps.version.outputs.VERSION }}" \
+            --base "${{ env.BASE_BRANCH }}" \
+            --label "automated,needs-review")
+
+          PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+          echo "PR_NUMBER=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "PR_URL=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: trigger security scan
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/${{ github.repository }}/dispatches \
+            --method POST \
+            --field event_type=security-scan \
+            --field "client_payload[pr_number]=${{ steps.create-pr.outputs.PR_NUMBER }}" \
+            --field "client_payload[branch]=release/${{ steps.version.outputs.VERSION }}"
