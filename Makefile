@@ -85,6 +85,49 @@ test\:all:
 test\:api:
 	@go test ./api/...
 
+## test:pressure — run the no-DB pressure suite (panic recovery, retry count, deadlock, goroutine leak)
+.SILENT:
+test\:pressure:
+	@go test ./api/... -run TestPressure -timeout 60s
+
+## test:race — run every test with the race detector enabled
+.SILENT:
+test\:race:
+	@go test -race ./api/...
+
+## test:bench — run all benchmarks once (1s/benchmark, memory stats)
+.SILENT:
+test\:bench:
+	@go test ./api/... -bench=. -benchmem -run=^$$ -benchtime=1s -timeout 180s
+
+## test:bench:long — run all benchmarks with a longer measurement window for stable numbers
+.SILENT:
+test\:bench\:long:
+	@go test ./api/... -bench=. -benchmem -run=^$$ -benchtime=5s -timeout 600s
+
+## test:bench:dispatch — run only the dispatch throughput benchmark (quickest signal)
+.SILENT:
+test\:bench\:dispatch:
+	@go test ./api/... -bench=BenchmarkDispatch -benchmem -run=^$$ -benchtime=5s
+
+## test:bench:before — save current benchmark numbers to before.txt for later comparison
+.SILENT:
+test\:bench\:before:
+	@go test ./api/... -bench=. -benchmem -run=^$$ -benchtime=2s -timeout 300s > before.txt
+	@echo "  ✓ wrote before.txt"
+
+## test:bench:after — save current benchmark numbers to after.txt and run benchstat against before.txt
+.SILENT:
+test\:bench\:after:
+	@go test ./api/... -bench=. -benchmem -run=^$$ -benchtime=2s -timeout 300s > after.txt
+	@echo "  ✓ wrote after.txt"
+	@if command -v benchstat >/dev/null 2>&1; then \
+		echo ""; \
+		benchstat before.txt after.txt; \
+	else \
+		echo "  (install benchstat for a diff: go install golang.org/x/perf/cmd/benchstat@latest)"; \
+	fi
+
 ## test:coverage — display per-package coverage summary
 .SILENT:
 test\:coverage:
@@ -106,25 +149,41 @@ test\:help:
 	@printf "\n"
 	@printf "  make test\:all               ── clear cache + run all packages\n"
 	@printf "  make test\:api               ── go test ./api/...\n"
+	@printf "  make test\:pressure          ── no-DB pressure suite (panic, retry, leak)\n"
+	@printf "  make test\:race              ── full suite with the race detector\n"
+	@printf "  make test\:bench             ── all benchmarks (1s each)\n"
+	@printf "  make test\:bench\:long        ── all benchmarks (5s each, stable numbers)\n"
+	@printf "  make test\:bench\:dispatch    ── dispatch throughput only (5s)\n"
+	@printf "  make test\:bench\:before      ── save current bench numbers to before.txt\n"
+	@printf "  make test\:bench\:after       ── save to after.txt and run benchstat\n"
 	@printf "  make test\:coverage          ── coverage summary for all packages\n"
 	@printf "  make test\:coverage\:browser  ── open HTML coverage report\n"
 	@printf "\n"
-	@printf "  ⚠  Postgres required\n"
-	@printf "  ────────────────────\n"
-	@printf "  Tests in api/ connect to a live Postgres instance.\n"
-	@printf "  Ensure your DATABASE_URL (or equivalent env var) is set\n"
-	@printf "  and the database is running before executing any test target.\n"
+	@printf "  ⚠  Postgres required for test\:all / test\:api / test\:race / test\:coverage\n"
+	@printf "  ────────────────────────────────────────────────────────────────────────\n"
+	@printf "  DB-backed tests connect to a live Postgres instance. Set DATABASE_*\n"
+	@printf "  env vars in api/testdata/.test.env before running those targets.\n"
+	@printf "\n"
+	@printf "  ✓  No DB required for test\:pressure and test\:bench\*\n"
+	@printf "  ───────────────────────────────────────────────────\n"
+	@printf "  Pressure tests and benchmarks use the memory backend only\n"
+	@printf "  and are safe to run in any environment (including CI).\n"
 	@printf "\n"
 	@printf "  Tips\n"
 	@printf "  ────\n"
 	@printf "  • test\:all clears the test cache first — use it for a clean run.\n"
 	@printf "  • test\:coverage\:browser writes coverage.out to the repo root.\n"
+	@printf "  • Benchmark workflow: test\:bench\:before → edit code → test\:bench\:after\n"
+	@printf "    prints a benchstat diff if benchstat is installed.\n"
+	@printf "  • Install benchstat: go install golang.org/x/perf/cmd/benchstat@latest\n"
 	@printf "\n"
 	@printf "  Troubleshooting\n"
 	@printf "  ───────────────\n"
 	@printf "  • 'dial tcp … connection refused' → Postgres is not reachable.\n"
 	@printf "  • 'pq: role … does not exist'     → check DB credentials.\n"
 	@printf "  • Test cache stale results         → run test\:all to reset.\n"
+	@printf "  • Benchmark hangs at BenchmarkRetryStorm → expected, retry backoff\n"
+	@printf "    sleeps up to 6s per iteration. Use -timeout 600s for -benchtime >1s.\n"
 	@printf "\n"
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐

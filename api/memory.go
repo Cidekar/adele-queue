@@ -57,10 +57,15 @@ func (q *Queue) addFailedJob(job Job, workerID int) {
 			delay = time.Duration(job.RetryCounter) * time.Second
 		}
 
-		time.Sleep(delay)
-
 		job.RetryCounter++
-		q.Jobs <- job
+		// Re-enqueue from a detached goroutine so the worker is not blocked
+		// holding the FailedJobs mutex and sending to an unbuffered channel
+		// that only the worker itself drains.
+		retryJob := job
+		go func() {
+			time.Sleep(delay)
+			q.Jobs <- retryJob
+		}()
 		return
 	}
 

@@ -25,7 +25,7 @@ import (
 type Configuration struct {
 	Backend             string   `yaml:"Backend"`             // "memory" or "redis" — default "memory"
 	WorkerCount         int      `yaml:"WorkerCount"`         // number of worker goroutines — default 1
-	MaxAttempts         int      `yaml:"MaxAttempts"`         // max retry attempts before permanent failure — default 3
+	MaxAttempts         int      `yaml:"MaxAttempts"`         // total handler executions before permanent failure, counting the initial attempt — default 3 (initial + 2 retries)
 	HighWaterMark       int      `yaml:"HighWaterMark"`       // in-memory failed-jobs cache size before reset — default 10000
 	QueueChannels       []string `yaml:"QueueChannels"`       // named queue channels
 	QueueChannelDefault string   `yaml:"QueueChannelDefault"` // default channel when Job.Queue is empty

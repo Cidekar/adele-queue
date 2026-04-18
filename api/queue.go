@@ -244,12 +244,7 @@ func (q *Queue) worker(id int, jobChannel chan Job, wg *sync.WaitGroup) {
 		for job := range jobChannel {
 			// Skip jobs that did not register a handler
 			if job.Handler != nil {
-				err := job.Handler(job.Payload)
-				if err != nil {
-					q.addFailedJob(job, id)
-					continue
-				}
-				q.addCompletedJob(job, id)
+				q.runHandler(job, id)
 			}
 		}
 	}
@@ -260,6 +255,24 @@ func (q *Queue) worker(id int, jobChannel chan Job, wg *sync.WaitGroup) {
 
 		q.cursorScanRedisDb(c, id)
 	}
+}
+
+// runHandler invokes a job's handler with panic recovery so a single bad
+// job cannot crash the worker goroutine. A recovered panic is recorded as
+// a failure on the job's exception field.
+func (q *Queue) runHandler(job Job, id int) {
+	defer func() {
+		if r := recover(); r != nil {
+			job.Exception = fmt.Sprintf("panic: %v", r)
+			q.addFailedJob(job, id)
+		}
+	}()
+	if err := job.Handler(job.Payload); err != nil {
+		job.Exception = err.Error()
+		q.addFailedJob(job, id)
+		return
+	}
+	q.addCompletedJob(job, id)
 }
 
 // CallRPCServer dials the adele RPC server and passes the unmarshaled job
