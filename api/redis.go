@@ -85,7 +85,11 @@ func (q *Queue) cursorScanRedisDb(c redis.Conn, workerID int) {
 
 			err = setRedisKey(&c, queue, jobID, formatPending, formatLocked)
 			if err != nil {
+				if strings.Contains(err.Error(), "no such key") {
+					continue
+				}
 				q.ErrorLog.Printf("error: unexpected error renaming job %s in redis from pending to locked. Redis server error: %+v\n", jobID, err)
+				continue
 			} else {
 				cachedJob, err := getRedisValue(&c, queue, jobID, formatLocked)
 				if err != nil {

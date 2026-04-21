@@ -277,12 +277,23 @@ func (q *Queue) runHandler(job Job, id int) {
 
 // CallRPCServer dials the adele RPC server and passes the unmarshaled job
 // bytes. Returns 0 on success, 1 on failure (with any accompanying error).
+//
+// Port resolution matches adele-framework: RPC_SERVER_PORT is the canonical
+// key, RPC_PORT is accepted as a legacy alias, and 4040 is the default when
+// neither is set. Dialing an empty port string produces 127.0.0.1:0, which
+// workers hammer in a tight loop — hence the default.
 func (q *Queue) CallRPCServer(cacheJob []byte) (int, error) {
 	exitCodes := map[string]int{
 		"success": 0,
 		"fail":    1,
 	}
-	port := os.Getenv("RPC_PORT")
+	port := os.Getenv("RPC_SERVER_PORT")
+	if port == "" {
+		port = os.Getenv("RPC_PORT")
+	}
+	if port == "" {
+		port = "4040"
+	}
 	client, err := rpc.Dial("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		q.ErrorLog.Println("error: unexpected error connecting to rpc server", err)

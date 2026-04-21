@@ -39,7 +39,7 @@ The YAML file uses PascalCase keys; the `SetProviderConfig` map uses snake_case 
 
 ### Redis backend / RPC worker
 
-When `Backend` is `redis`, workers deliver the marshaled job to the Adele RPC server. The queue reads the `RPC_PORT` environment variable and dials `127.0.0.1:$RPC_PORT` for each dispatch. This is the only environment variable the queue consumes directly; set it in your process environment alongside whatever the framework's RPC server is bound to.
+When `Backend` is `redis`, workers deliver the marshaled job to the Adele RPC server. The queue resolves the port from `RPC_SERVER_PORT` (the canonical key shared with `adele-framework`), falling back to `RPC_PORT` for compatibility, and finally defaulting to `4040` when neither is set. Workers dial `127.0.0.1:<port>` for each dispatch. This is the only environment variable the queue consumes directly; set it in your process environment alongside whatever the framework's RPC server is bound to.
 
 ## Backends
 
