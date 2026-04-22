@@ -32,6 +32,8 @@ type Configuration struct {
 	Debug               bool     `yaml:"Debug"`               // verbose logging
 	RedisPrefix         string   `yaml:"RedisPrefix"`         // redis keyspace prefix
 	RedisScanInterval   int      `yaml:"RedisScanInterval"`   // seconds between redis SCAN iterations — default 1
+	LockTimeout         int      `yaml:"LockTimeout"`         // seconds; queue-wide default when Job.LockFor is 0
+	ReaperInterval      int      `yaml:"ReaperInterval"`      // seconds; default 30
 }
 
 // Queue is used to hold the jobs that are being processed by the workers.
@@ -53,6 +55,16 @@ type Queue struct {
 	QueueChannels       []string
 	QueueChannelDefault string
 	DB                  up.Session
+	LockTimeout         int
+	ReaperInterval      int
+	// handlers is an in-process, name-keyed registry of handler functions.
+	// Used by the redis backend, which cannot serialize the Job.Handler func
+	// pointer. Not persisted; populated at application bootstrap via
+	// RegisterHandler.
+	handlers struct {
+		mu sync.RWMutex
+		m  map[string]func(payload interface{}) error
+	}
 }
 
 // Redis holds the redis connection pool and keyspace-scan settings used by the
@@ -77,6 +89,8 @@ type Job struct {
 	RetryAfter     string                          `json:"-"`
 	CompletedAt    string                          `json:"completedAt"`
 	FailedAt       string                          `json:"failedAt"`
+	LockedAt       string                          `json:"lockedAt,omitempty"`
+	LockFor        int                             `json:"lockFor,omitempty"`
 	Queue          string                          `json:"queue"`
 	CreatedAt      time.Time                       `db:"created_at" redis:"-" json:"-"`
 	UpdatedAt      time.Time                       `db:"updated_at" redis:"-" json:"-"`

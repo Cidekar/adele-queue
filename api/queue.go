@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net/rpc"
 	"os"
 	"path/filepath"
 	"sync"
@@ -74,6 +73,8 @@ func buildQueue(a *adele.Adele, cfg Configuration) *Queue {
 		HighWaterMark:       cfg.HighWaterMark,
 		QueueChannels:       cfg.QueueChannels,
 		QueueChannelDefault: cfg.QueueChannelDefault,
+		LockTimeout:         cfg.LockTimeout,
+		ReaperInterval:      cfg.ReaperInterval,
 		Redis: Redis{
 			Prefix:       cfg.RedisPrefix,
 			ScanInterval: cfg.RedisScanInterval,
@@ -119,6 +120,11 @@ func buildQueue(a *adele.Adele, cfg Configuration) *Queue {
 	// to minimize reallocations under load.
 	q.FailedJobs.data = make([]string, 0, q.HighWaterMark)
 
+	// Initialize the name-keyed handler registry. Consumers populate this at
+	// bootstrap via RegisterHandler; the redis backend looks up handlers here
+	// because Job.Handler cannot survive redis serialization.
+	q.handlers.m = make(map[string]func(payload interface{}) error)
+
 	// Guarantee the default channel is present in the configured channel list.
 	if !slices.Contains(q.QueueChannels, q.QueueChannelDefault) {
 		q.QueueChannels = append(q.QueueChannels, q.QueueChannelDefault)
@@ -149,6 +155,18 @@ func setConfigDefaults(c *Configuration) {
 	}
 	if c.QueueChannelDefault == "" {
 		c.QueueChannelDefault = "job"
+	}
+	if c.LockTimeout <= 0 {
+		c.LockTimeout = 300
+	}
+	if c.ReaperInterval <= 0 {
+		c.ReaperInterval = 30
+	}
+	if c.ReaperInterval >= c.LockTimeout {
+		c.ReaperInterval = c.LockTimeout / 2
+		if c.ReaperInterval < 1 {
+			c.ReaperInterval = 1
+		}
 	}
 }
 
@@ -208,8 +226,16 @@ func (q *Queue) Close(mWG *sync.WaitGroup) {
 		// Cancel the cursor scan
 		systemShutdown = true
 
-		// Wait for workers to process any jobs that were picked up
-		wg.Wait()
+		// Wait for workers + reaper to drain, bounded by one reaper tick plus
+		// a small grace period. A worker blocked on redis I/O will trigger
+		// the timeout log so operators can investigate hung connections.
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Duration(q.ReaperInterval+5) * time.Second):
+			q.ErrorLog.Println("reaper: shutdown timeout; goroutines may still be running")
+		}
 
 		if q.Debug {
 			q.InfoLog.Printf("queue gracefully shutdown\n")
@@ -231,6 +257,14 @@ func (q *Queue) Listen() {
 	for i := 1; i <= q.WorkerCount; i++ {
 		wg.Add(1)
 		go q.worker(i, q.Jobs, &wg)
+	}
+
+	if q.Backend == "redis" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.reapStaleLocks()
+		}()
 	}
 }
 
@@ -275,27 +309,36 @@ func (q *Queue) runHandler(job Job, id int) {
 	q.addCompletedJob(job, id)
 }
 
-// CallRPCServer dials the adele RPC server and passes the unmarshaled job
-// bytes. Returns 0 on success, 1 on failure (with any accompanying error).
-func (q *Queue) CallRPCServer(cacheJob []byte) (int, error) {
-	exitCodes := map[string]int{
-		"success": 0,
-		"fail":    1,
+// RegisterHandler binds a handler function to a job name for the in-process
+// dispatch registry used by the redis backend. Consumers call this at
+// application bootstrap, once per unique Job.Name they will dispatch.
+//
+// The memory backend does not use the registry — it invokes Job.Handler
+// directly — so registration is only required when the redis backend is
+// active. Registering defensively in both cases is safe and recommended.
+//
+// Returns an error on empty name, nil fn, or duplicate registration.
+//
+// Example:
+//
+//	q.RegisterHandler("hello", helloHandler)
+func (q *Queue) RegisterHandler(name string, fn func(payload interface{}) error) error {
+	if name == "" {
+		return fmt.Errorf("queue: RegisterHandler requires a non-empty name")
 	}
-	port := os.Getenv("RPC_PORT")
-	client, err := rpc.Dial("tcp", "127.0.0.1:"+port)
-	if err != nil {
-		q.ErrorLog.Println("error: unexpected error connecting to rpc server", err)
-		return 1, err
+	if fn == nil {
+		return fmt.Errorf("queue: RegisterHandler requires a non-nil function for %q", name)
 	}
-
-	var reply int
-	err = client.Call("RPCServer.Queue", &cacheJob, &reply)
-	if err != nil {
-		return exitCodes["fail"], err
+	q.handlers.mu.Lock()
+	defer q.handlers.mu.Unlock()
+	if q.handlers.m == nil {
+		q.handlers.m = make(map[string]func(payload interface{}) error)
 	}
-
-	return exitCodes["success"], nil
+	if _, exists := q.handlers.m[name]; exists {
+		return fmt.Errorf("queue: handler %q already registered", name)
+	}
+	q.handlers.m[name] = fn
+	return nil
 }
 
 // Dispatch adds a job to the queue and returns the id of the job.

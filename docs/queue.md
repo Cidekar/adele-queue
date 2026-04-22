@@ -36,10 +36,12 @@ The YAML file uses PascalCase keys; the `SetProviderConfig` map uses snake_case 
 | `Debug` | `debug` | bool | `false` | Verbose logging via the framework's logger. |
 | `RedisPrefix` | `redis_prefix` | string | `""` | Redis keyspace prefix; inherited from the framework's redis cache when not set. |
 | `RedisScanInterval` | `redis_scan_interval` | int | `1` | Seconds between redis `SCAN` iterations per worker. |
+| `LockTimeout` | `lock_timeout` | int | `300` | Seconds a job may remain in the `locked:` state before the reaper considers it stale and requeues/fails it. Must exceed the longest legitimate handler runtime. |
+| `ReaperInterval` | `reaper_interval` | int | `30` | Seconds between reaper scans over `queues:*:locked:*`. Auto-clamped to `lock_timeout / 2` when set larger than `lock_timeout`. |
 
 ### Redis backend / RPC worker
 
-When `Backend` is `redis`, workers deliver the marshaled job to the Adele RPC server. The queue reads the `RPC_PORT` environment variable and dials `127.0.0.1:$RPC_PORT` for each dispatch. This is the only environment variable the queue consumes directly; set it in your process environment alongside whatever the framework's RPC server is bound to.
+When `Backend` is `redis`, workers deliver the marshaled job to the Adele RPC server. The queue resolves the port from `RPC_SERVER_PORT` (the canonical key shared with `adele-framework`), falling back to `RPC_PORT` for compatibility, and finally defaulting to `4040` when neither is set. Workers dial `127.0.0.1:<port>` for each dispatch. This is the only environment variable the queue consumes directly; set it in your process environment alongside whatever the framework's RPC server is bound to.
 
 ## Backends
 
@@ -54,6 +56,46 @@ Trade-offs: zero dependencies, zero network round-trips, but jobs pending in the
 The redis backend uses redis hashes keyed as `queues:<channel>:<state>:<job-id>` where `<state>` is one of `pending`, `locked`, `completed`, `failed`. Workers cooperatively `SCAN` the pending keyspace and `RENAME` matching keys to `locked` to claim a job. Payload delivery uses the Adele RPC server — each worker dials `127.0.0.1:$RPC_PORT` and pushes the marshaled job for the application to execute. On success the key moves to `completed`; on failure it either returns to `pending` with updated `RetryAfter` or moves to `failed` once `MaxAttempts` is reached.
 
 Trade-offs: jobs survive process restarts, multiple processes can share the queue, but every dispatch and state transition is a redis round-trip.
+
+### Stale Lock Reaping
+
+When the redis backend is active, a dedicated goroutine scans `queues:*:locked:*` every `reaper_interval` seconds to detect jobs orphaned by crashed or stalled workers.
+
+- Each locked job is checked against its **effective timeout**: `Job.LockFor` if set (> 0), otherwise the queue-wide `lock_timeout`.
+- Any job whose `LockedAt` is older than its effective timeout is routed through the same retry / permafail paths the in-process handler uses.
+- Requeued jobs go back to `pending:` with `RetryCounter += 1`, `RetryAfter = now + RetryCounter*5s`, `Exception = "lock expired after Xs"` (where X is the effective timeout).
+- Jobs at or over `MaxAttempts` move to `failed:` and insert a `failed_jobs` row.
+- The reaper honors `systemShutdown`; it stops cleanly on `Close()`.
+- The reaper is not started for the memory backend (no persistence, no orphans possible).
+
+### Per-Job Timeout Override (LockFor)
+
+Set `Job.LockFor` (seconds) when a job is known to take longer than the queue default:
+
+```go
+job := api.Job{
+    Name:    "nightly-export",
+    Payload: payload,
+    Retry:   true,
+    LockFor: 14 * 3600, // 14 hours; beats the 300s queue default
+}
+queue.Dispatch(job)
+```
+
+`LockFor` is persisted on the redis hash and survives restarts. The reaper respects it on every scan. Leave `LockFor` unset (zero) to use `lock_timeout`. There is no upper bound — a day-long `LockFor` is valid.
+
+#### Tuning Guidance
+
+- The default 300s `lock_timeout` is conservative for the common case. Shorten it if most of your handlers finish in under 30s AND you want faster crash recovery.
+- For handlers that legitimately run longer, set `Job.LockFor` per-job rather than inflating `lock_timeout`.
+- `reaper_interval` sets scan cadence, not per-job timeout. 30s is fine for most apps; a 12-hour `LockFor` with a 30s interval simply scans 1440 no-ops before expiry.
+- For manual testing: `lock_timeout=10, reaper_interval=5` via `SetProviderConfig` + `LockFor=0` on test jobs.
+
+### Reaper Observability
+
+- Every reaper tick logs at Info level whenever it scanned or errored: `reaper: scanned=N requeued=R permafailed=P recent=X dupes=D errs=E`. Empty ticks are silent to avoid log spam.
+- Cumulative counters are exposed via `q.ReaperStats()` returning `ReaperStats{Ticks, ScannedKeys, Requeued, Permafailed, SkippedRecent, SkippedDupePending, Errors}`. Use this for metrics export (Prometheus, statsd, etc.) or tests.
+- The `Debug` config flag adds per-job log lines (`reaper: requeued <jobID> (attempt N, timeout Ts)`, `reaper: permafailed <jobID> after N attempts (lock expired after Ts)`).
 
 ## Dispatching a Job
 
@@ -102,8 +144,8 @@ Callers can introspect failures via `Queue.GetFailedJobsFromMemory()` (recent id
 
 ## Worker Lifecycle
 
-- `Listen()` — starts `WorkerCount` goroutines; called automatically by the provider's `Boot`.
-- `Close(*sync.WaitGroup)` — stops new dispatches and waits for in-flight jobs to drain. Pass a non-nil `WaitGroup` when orchestrating shutdown across multiple subsystems; the queue will call `Done()` on your behalf. Closing the memory backend closes the jobs channel; closing the redis backend flips a process-wide shutdown flag that the scanner observes on its next iteration.
+- `Listen()` — starts `WorkerCount` goroutines; called automatically by the provider's `Boot`. When the redis backend is active, it also starts the stale-lock reaper goroutine, tracked by the same package-level `wg` as workers so `Close()` drains both together.
+- `Close(*sync.WaitGroup)` — stops new dispatches and waits for in-flight jobs to drain. Pass a non-nil `WaitGroup` when orchestrating shutdown across multiple subsystems; the queue will call `Done()` on your behalf. Closing the memory backend closes the jobs channel; closing the redis backend flips a process-wide shutdown flag that the scanner and reaper observe on their next iteration, then waits up to `reaper_interval + 5s` for goroutines to exit.
 
 The queue does not install shutdown hooks. Applications are expected to call `Close` during graceful termination (for example, from the same `signal.Notify` handler that shuts down the HTTP server).
 

@@ -8,3 +8,5 @@ QueueChannelDefault: job
 Debug: false
 RedisPrefix: ""
 RedisScanInterval: 1
+LockTimeout: 300
+ReaperInterval: 30
