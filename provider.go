@@ -67,6 +67,12 @@ func (p *ServiceProvider) Configure(config map[string]interface{}) error {
 	if redisScanInterval, ok := config["redis_scan_interval"].(int); ok {
 		p.config.RedisScanInterval = redisScanInterval
 	}
+	if v, ok := config["lock_timeout"].(int); ok {
+		p.config.LockTimeout = v
+	}
+	if v, ok := config["reaper_interval"].(int); ok {
+		p.config.ReaperInterval = v
+	}
 	p.hasConfig = true
 	return nil
 }

@@ -9,7 +9,7 @@ A first-party queue package for the Adele Go framework. Ships as an Adele `Servi
 | Backend | Description | Use Case |
 |---|---|---|
 | `memory` | Single-process channel-based queue with sync.WaitGroup-backed worker pool. | Local development, single-node deployments, short-lived jobs. |
-| `redis` | Distributed queue backed by Redis hashes; workers cooperatively scan the keyspace for pending jobs and atomically rename keys between pending, locked, completed, and failed states. | Multi-process deployments, horizontal scaling, jobs that must survive process restarts. |
+| `redis` | Distributed queue backed by Redis hashes; workers cooperatively scan the keyspace for pending jobs and atomically rename keys between pending, locked, completed, and failed states. Orphaned `locked:` keys from crashed workers are recovered automatically — see [Stale Lock Reaping](./docs/queue.md). | Multi-process deployments, horizontal scaling, jobs that must survive process restarts. |
 
 ## Requirements
 
@@ -51,6 +51,8 @@ app.Provider.SetProviderConfig("queue", map[string]interface{}{
     "debug":                 false,
     "redis_prefix":          "myapp",
     "redis_scan_interval":   1,
+    "lock_timeout":          300,
+    "reaper_interval":       30,
 })
 ```
 

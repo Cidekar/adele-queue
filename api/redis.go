@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -91,6 +90,9 @@ func (q *Queue) cursorScanRedisDb(c redis.Conn, workerID int) {
 				q.ErrorLog.Printf("error: unexpected error renaming job %s in redis from pending to locked. Redis server error: %+v\n", jobID, err)
 				continue
 			} else {
+				if _, hsetErr := c.Do("HSET", fmt.Sprintf(formatLocked, queue, jobID), "LockedAt", time.Now().UTC().Format(time.RFC3339)); hsetErr != nil {
+					q.ErrorLog.Printf("error writing LockedAt for job %s: %v", jobID, hsetErr)
+				}
 				cachedJob, err := getRedisValue(&c, queue, jobID, formatLocked)
 				if err != nil {
 					q.ErrorLog.Printf("error: unexpected response from redis getting value for %s. Response error: %+v\n", jobID, err)
@@ -178,17 +180,42 @@ func (q *Queue) handleRedisJob(queue string, cachedJob Job, jobID string, c redi
 		return
 	}
 
-	rawValueFromRedis, err := json.Marshal(cachedJob)
-	if err != nil {
-		q.ErrorLog.Println("error: unexpected error marshaling payload:", err)
-		return
-	}
+	// Look up the handler by job name. Job.Handler (a func pointer) is tagged
+	// redis:"-" so it cannot survive serialization — the only way to invoke
+	// the handler from the redis path is via this in-process registry,
+	// populated at application bootstrap by calls to RegisterHandler.
+	q.handlers.mu.RLock()
+	fn := q.handlers.m[cachedJob.Name]
+	q.handlers.mu.RUnlock()
 
-	res, rpcError := q.CallRPCServer(rawValueFromRedis)
+	var res int
+	var rpcError error
+	if fn == nil {
+		// No handler registered for this job name. Skip retries and route
+		// straight through the permanent-failure branch with a clear
+		// Exception — retries would only defer the same failure.
+		cachedJob.Retry = false
+		rpcError = fmt.Errorf("no handler registered for %q", cachedJob.Name)
+		res = 1
+	} else {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rpcError = fmt.Errorf("handler panic: %v", r)
+					res = 1
+				}
+			}()
+			if err := fn(cachedJob.Payload); err != nil {
+				rpcError = err
+				res = 1
+			}
+		}()
+	}
 	if res == 0 {
 		now := time.Now().UTC()
 		cachedJob.CompletedAt = now.Format(time.RFC3339)
 		cachedJob.Status = statusComplete
+		cachedJob.Exception = ""
 		_, err = c.Do("HSET", redis.Args{}.Add(fmt.Sprintf(formatLocked, queue, jobID)).AddFlat(&cachedJob)...)
 		if err != nil {
 			q.ErrorLog.Println("error: unexpected error adding job to queue:", err)
