@@ -1,0 +1,14 @@
+bin/
+.env.queuebench
+
+# adele.New creates these when queuebench runs — framework scaffold, ignore.
+/.env
+/handlers/
+/jobs/
+/logs/
+/middleware/
+/models/
+/public/
+/resources/
+/storage/
+/config/cors.yml.bak
