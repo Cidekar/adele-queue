@@ -60,6 +60,8 @@ app.Provider.SetProviderConfig("queue", map[string]interface{}{
 
 For complete documentation including configuration reference, backend behavior, dispatch and retry semantics, and worker lifecycle, see the [full documentation](./docs/queue.md).
 
+Maintainers: run the redis-backed job harness with `make bench:help`.
+
 ## License
 
 Copyright 2025 Cidekar, LLC. All rights reserved.

@@ -19,6 +19,7 @@ help:
 	@printf "\n"
 	@printf "  make build\:help    ── build & vet commands\n"
 	@printf "  make test\:help     ── test commands (require Postgres)\n"
+	@printf "  make bench\:help    ── bench harness commands (redis-backed)\n"
 	@printf "  make release\:help  ── release & tagging workflow\n"
 	@printf "\n"
 
@@ -184,6 +185,112 @@ test\:help:
 	@printf "  • Test cache stale results         → run test\:all to reset.\n"
 	@printf "  • Benchmark hangs at BenchmarkRetryStorm → expected, retry backoff\n"
 	@printf "    sleeps up to 6s per iteration. Use -timeout 600s for -benchtime >1s.\n"
+	@printf "\n"
+
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  Bench Harness (Redis-Backed)                                                │
+# └─────────────────────────────────────────────────────────────────────────────┘
+
+REDIS_CONTAINER ?= adele_garbage-redis-1
+
+## bench:build — build the queuebench CLI (requires build tag queuebench)
+.SILENT:
+bench\:build:
+	@echo ""
+	@echo "  → go build -tags queuebench -o bin/queuebench ./cmd/queuebench"
+	@go build -tags queuebench -o bin/queuebench ./cmd/queuebench
+	@echo "  ✓ bin/queuebench"
+	@echo ""
+
+## bench:seed — dispatch one of every job type; keeps running
+.SILENT:
+bench\:seed:
+	@$(MAKE) bench:build
+	@echo "  → bin/queuebench --seed-jobs"
+	@./bin/queuebench --seed-jobs
+
+## bench:stress — dispatch 1000 mixed jobs; keeps running
+.SILENT:
+bench\:stress:
+	@$(MAKE) bench:build
+	@echo "  → bin/queuebench --stress-jobs=1000 --stress-concurrency=16 --stress-mode=mixed"
+	@./bin/queuebench --stress-jobs=1000 --stress-concurrency=16 --stress-mode=mixed
+
+## bench:long-sleep — dispatch one 60s sleep job (for SIGKILL / reaper testing)
+.SILENT:
+bench\:long-sleep:
+	@$(MAKE) bench:build
+	@echo "  → bin/queuebench --long-sleep=60"
+	@./bin/queuebench --long-sleep=60
+
+## bench:reaper-test — orchestrated reaper regression via SIGKILL
+.SILENT:
+bench\:reaper-test:
+	@$(MAKE) bench:build
+	@echo "  → bench:reaper-test (SIGKILL orchestration)"
+	@docker exec $(REDIS_CONTAINER) redis-cli --scan --pattern 'queues:*' | xargs -r docker exec $(REDIS_CONTAINER) redis-cli DEL > /dev/null || true
+	@./bin/queuebench --long-sleep=60 > /tmp/queuebench-phase1.log 2>&1 & \
+		APP_PID=$$! ; \
+		sleep 3 ; \
+		LOCKED=$$(docker exec $(REDIS_CONTAINER) redis-cli --scan --pattern 'queues:*:locked:*' | wc -l) ; \
+		kill -9 $$APP_PID 2>/dev/null ; \
+		echo "  phase 1: locked before kill = $$LOCKED" ; \
+		if [ $$LOCKED -eq 0 ]; then echo "  FAIL: no locked keys observed"; exit 1; fi ; \
+		./bin/queuebench > /tmp/queuebench-phase2.log 2>&1 & \
+		APP2_PID=$$! ; \
+		sleep 20 ; \
+		kill $$APP2_PID 2>/dev/null ; \
+		wait $$APP2_PID 2>/dev/null || true ; \
+		grep -E 'reaper: .* permafailed=[1-9]' /tmp/queuebench-phase2.log > /dev/null ; \
+		RC=$$? ; \
+		if [ $$RC -eq 0 ]; then \
+			echo "  ✓ reaper permafailed orphan" ; \
+			grep 'reaper:' /tmp/queuebench-phase2.log | head -5 ; \
+		else \
+			echo "  FAIL: no 'permafailed>=1' in reaper log" ; \
+			tail -40 /tmp/queuebench-phase2.log ; \
+			exit 1 ; \
+		fi
+
+## bench:clean — delete bench binary and flush queuebench keys from redis
+.SILENT:
+bench\:clean:
+	@rm -rf bin/
+	@docker exec $(REDIS_CONTAINER) redis-cli --scan --pattern 'queues:*' | xargs -r docker exec $(REDIS_CONTAINER) redis-cli DEL > /dev/null || true
+	@echo "  ✓ cleaned bin/ and redis keys"
+
+## bench:help — display bench harness documentation
+.SILENT:
+bench\:help:
+	@printf "\n"
+	@printf "  ┌─────────────────────────────────────────────────────────────────┐\n"
+	@printf "  │  Bench harness (redis-backed)                                    │\n"
+	@printf "  └─────────────────────────────────────────────────────────────────┘\n"
+	@printf "\n"
+	@printf "  make bench\:build        ── build bin/queuebench (tag: queuebench)\n"
+	@printf "  make bench\:seed         ── dispatch one of each of 15 job types\n"
+	@printf "  make bench\:stress       ── 1000 mixed jobs, concurrency 16\n"
+	@printf "  make bench\:long-sleep   ── one 60s sleep job (for SIGKILL tests)\n"
+	@printf "  make bench\:reaper-test  ── orchestrated reaper regression\n"
+	@printf "  make bench\:clean        ── rm bin/ and flush queuebench redis keys\n"
+	@printf "\n"
+	@printf "  Prerequisites\n"
+	@printf "  ─────────────\n"
+	@printf "  • Redis reachable — defaults to container '$$REDIS_CONTAINER'\n"
+	@printf "    (override with: REDIS_CONTAINER=my-redis make bench\:seed).\n"
+	@printf "  • .env.queuebench in repo root. Copy from .env.queuebench.example.\n"
+	@printf "\n"
+	@printf "  Harness defaults\n"
+	@printf "  ────────────────\n"
+	@printf "  • lock_timeout=10s, reaper_interval=5s (fast feedback for testing).\n"
+	@printf "  • Production adele-queue defaults are 300s / 30s — configure via\n"
+	@printf "    SetProviderConfig in consumer apps.\n"
+	@printf "\n"
+	@printf "  Difference vs. test\:bench\n"
+	@printf "  ─────────────────────────\n"
+	@printf "  • test\:bench runs go test -bench — memory backend, no redis.\n"
+	@printf "  • bench\:* runs the queuebench CLI against live redis — full\n"
+	@printf "    end-to-end including registry, reaper, retry state machine.\n"
 	@printf "\n"
 
 # ┌─────────────────────────────────────────────────────────────────────────────┐

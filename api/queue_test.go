@@ -32,7 +32,10 @@ func TestQueue_Dispatch_Job(t *testing.T) {
 	runMigrations(t)
 	defer tearDownDatabase(t)
 
-	q := NewWithConfig(&ade, Configuration{Backend: "memory"})
+	q, err := NewWithConfig(&ade, Configuration{Backend: "memory"})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
 	q.Listen()
 
 	instance := Job{
@@ -60,7 +63,10 @@ func TestQueue_Dispatch_Failed_Job(t *testing.T) {
 	runMigrations(t)
 	defer tearDownDatabase(t)
 
-	q := NewWithConfig(&ade, Configuration{Backend: "memory"})
+	q, err := NewWithConfig(&ade, Configuration{Backend: "memory"})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
 	q.Listen()
 
 	instance := Job{
@@ -95,10 +101,13 @@ func TestQueue_Can_Empty_Failed_Job_Cache(t *testing.T) {
 	runMigrations(t)
 	defer tearDownDatabase(t)
 
-	q := NewWithConfig(&ade, Configuration{
+	q, err := NewWithConfig(&ade, Configuration{
 		Backend:       "memory",
 		HighWaterMark: 1,
 	})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
 	q.Listen()
 
 	instance := Job{

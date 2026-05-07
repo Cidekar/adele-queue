@@ -10,7 +10,11 @@ import (
 // RegisterHandler does not require a running backend or database.
 func newQueueForRegistryTest(t *testing.T) *Queue {
 	t.Helper()
-	return NewWithConfig(nil, Configuration{Backend: "memory"})
+	q, err := NewWithConfig(nil, Configuration{Backend: "memory"})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	return q
 }
 
 func TestRegisterHandler_Happy(t *testing.T) {
