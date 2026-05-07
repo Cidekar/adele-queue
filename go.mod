@@ -88,5 +88,3 @@ require (
 	golang.org/x/text v0.31.0 // indirect
 	google.golang.org/protobuf v1.36.7 // indirect
 )
-
-replace github.com/cidekar/adele-framework => /Users/harrisondestefano/Documents/_cidekar/adele-framework-upstream
