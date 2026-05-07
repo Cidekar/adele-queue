@@ -38,14 +38,17 @@ var templateFS embed.FS
 //
 // Example:
 //
-//	q := api.New(app)
+//	q, err := api.New(app)
+//	if err != nil {
+//	    return err
+//	}
 //	q.Listen()
-func New(a *adele.Adele) *Queue {
+func New(a *adele.Adele) (*Queue, error) {
 	cfg, err := loadConfig(a)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("queue: load config: %w", err)
 	}
-	return buildQueue(a, *cfg)
+	return buildQueue(a, *cfg), nil
 }
 
 // NewWithConfig creates a new Queue instance with a caller-supplied
@@ -54,9 +57,12 @@ func New(a *adele.Adele) *Queue {
 // Example:
 //
 //	cfg := api.Configuration{Backend: "memory", WorkerCount: 2}
-//	q := api.NewWithConfig(app, cfg)
-func NewWithConfig(a *adele.Adele, config Configuration) *Queue {
-	return buildQueue(a, config)
+//	q, err := api.NewWithConfig(app, cfg)
+//	if err != nil {
+//	    return err
+//	}
+func NewWithConfig(a *adele.Adele, config Configuration) (*Queue, error) {
+	return buildQueue(a, config), nil
 }
 
 // buildQueue assembles a *Queue from the given configuration and Adele

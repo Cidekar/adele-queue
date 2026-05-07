@@ -20,13 +20,16 @@ import (
 // measurement. Reuses the package-level `ade` from setup_test.go.
 func benchQueue(b *testing.B, workers int) *Queue {
 	b.Helper()
-	q := NewWithConfig(&ade, Configuration{
+	q, err := NewWithConfig(&ade, Configuration{
 		Backend:             "memory",
 		WorkerCount:         workers,
 		MaxAttempts:         3,
 		HighWaterMark:       100000,
 		QueueChannelDefault: "job",
 	})
+	if err != nil {
+		b.Fatalf("setup: %v", err)
+	}
 	q.Listen()
 	b.Cleanup(func() { q.Close(nil) })
 	return q

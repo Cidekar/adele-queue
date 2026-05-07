@@ -1,6 +1,8 @@
 package queue
 
 import (
+	"fmt"
+
 	adele "github.com/cidekar/adele-framework"
 	"github.com/cidekar/adele-framework/provider"
 	"github.com/cidekar/adele-queue/api"
@@ -82,12 +84,17 @@ func (p *ServiceProvider) Configure(config map[string]interface{}) error {
 func (p *ServiceProvider) Register(app interface{}) error {
 	a := app.(*adele.Adele)
 
+	var svc *api.Queue
+	var err error
 	if p.hasConfig {
-		p.service = api.NewWithConfig(a, p.config)
+		svc, err = api.NewWithConfig(a, p.config)
 	} else {
-		p.service = api.New(a)
+		svc, err = api.New(a)
 	}
-
+	if err != nil {
+		return fmt.Errorf("queue: register provider: %w", err)
+	}
+	p.service = svc
 	return nil
 }
 

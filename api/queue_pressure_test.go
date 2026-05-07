@@ -20,13 +20,16 @@ import (
 // value from setup_test.go. No DB interaction is needed for these tests.
 func newTestQueue(tb testing.TB, workers int) *Queue {
 	tb.Helper()
-	q := NewWithConfig(&ade, Configuration{
+	q, err := NewWithConfig(&ade, Configuration{
 		Backend:             "memory",
 		WorkerCount:         workers,
 		MaxAttempts:         3,
 		HighWaterMark:       10000,
 		QueueChannelDefault: "job",
 	})
+	if err != nil {
+		tb.Fatalf("setup: %v", err)
+	}
 	q.Listen()
 	tb.Cleanup(func() { q.Close(nil) })
 	return q
