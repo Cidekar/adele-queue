@@ -87,13 +87,18 @@ type Job struct {
 	RetryCounter   int                             `db:"attempts" json:"retryCounter"`
 	ReservedAt     string                          `db:"-" json:"reservedAt"`
 	RetryAfter     string                          `json:"-"`
-	CompletedAt    string                          `json:"completedAt"`
-	FailedAt       string                          `json:"failedAt"`
-	LockedAt       string                          `json:"lockedAt,omitempty"`
-	LockFor        int                             `json:"lockFor,omitempty"`
-	Queue          string                          `json:"queue"`
-	CreatedAt      time.Time                       `db:"created_at" redis:"-" json:"-"`
-	UpdatedAt      time.Time                       `db:"updated_at" redis:"-" json:"-"`
-	Exception      string                          `db:"exception" json:"exception"`
-	Status         string                          `db:"-" json:"status"`
+	// DispatchAt schedules the earliest moment the job may run, in RFC3339
+	// UTC format. A zero/empty value preserves immediate-dispatch behavior.
+	// Honored by both the memory and redis backends; the redis scheduler
+	// reuses the RetryAfter gate, the memory backend defers via goroutine.
+	DispatchAt  string    `json:"dispatchAt,omitempty"`
+	CompletedAt string    `json:"completedAt"`
+	FailedAt    string    `json:"failedAt"`
+	LockedAt    string    `json:"lockedAt,omitempty"`
+	LockFor     int       `json:"lockFor,omitempty"`
+	Queue       string    `json:"queue"`
+	CreatedAt   time.Time `db:"created_at" redis:"-" json:"-"`
+	UpdatedAt   time.Time `db:"updated_at" redis:"-" json:"-"`
+	Exception   string    `db:"exception" json:"exception"`
+	Status      string    `db:"-" json:"status"`
 }

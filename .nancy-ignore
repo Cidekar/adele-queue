@@ -2,3 +2,10 @@
 # No patched version available upstream as of 2026-04-17. We are on the latest release (v5.9.2).
 # Transitive dependency via upper/db. Monitor https://github.com/jackc/pgx for a fix.
 CVE-2026-33815
+
+# github.com/jackc/pgx/v5@v5.9.2 — CVE-2026-41889 (CVSS 2.3, SQL injection)
+# Indirect dependency pulled in by upper/db. govulncheck reachability
+# analysis confirms no queue code calls the vulnerable symbol. No
+# upstream fix published as of 2026-05-06 (latest pgx/v5 is v5.9.2 —
+# same version Nancy flags). Re-evaluate when jackc/pgx ships v5.9.3+.
+CVE-2026-41889

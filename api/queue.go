@@ -260,9 +260,25 @@ func (q *Queue) Close(mWG *sync.WaitGroup) {
 // Listen starts the configured number of worker goroutines, each of which
 // processes jobs until the queue is closed.
 func (q *Queue) Listen() {
+	// Always-on boot log so consumers can confirm the queue is alive without
+	// having to enable Debug. Single line, backend + worker count.
+	q.InfoLog.Printf("queue: listening backend=%s workers=%d", q.Backend, q.WorkerCount)
+
+	if q.Debug {
+		switch q.Backend {
+		case "redis":
+			q.InfoLog.Printf("queue: redis pool resolved prefix=%s scan_interval=%ds", q.Redis.Prefix, q.Redis.ScanInterval)
+		case "memory":
+			q.InfoLog.Printf("queue: memory channel ready high_water_mark=%d", q.HighWaterMark)
+		}
+	}
+
 	for i := 1; i <= q.WorkerCount; i++ {
 		wg.Add(1)
 		go q.worker(i, q.Jobs, &wg)
+		if q.Debug {
+			q.InfoLog.Printf("queue: worker %d started", i)
+		}
 	}
 
 	if q.Backend == "redis" {
@@ -271,6 +287,9 @@ func (q *Queue) Listen() {
 			defer wg.Done()
 			q.reapStaleLocks()
 		}()
+		if q.Debug {
+			q.InfoLog.Printf("queue: reaper started lock_timeout=%ds reaper_interval=%ds", q.LockTimeout, q.ReaperInterval)
+		}
 	}
 }
 
@@ -348,17 +367,42 @@ func (q *Queue) RegisterHandler(name string, fn func(payload interface{}) error)
 }
 
 // Dispatch adds a job to the queue and returns the id of the job.
+//
+// When Job.DispatchAt is a non-empty RFC3339 timestamp, dispatch is deferred
+// until that moment: the redis backend seeds RetryAfter so the scanner gates
+// the job, and the memory backend dispatches via a detached goroutine that
+// sleeps until the target time. An unparseable DispatchAt returns an error.
 func (q *Queue) Dispatch(job Job) (string, error) {
 	job.ID = uuid.Must(uuid.NewRandom()).String()
 	now := time.Now().UTC().Format(queueTimeFormat)
 	job.ReservedAt = now
-	job.RetryAfter = now
+	if job.DispatchAt != "" {
+		job.RetryAfter = job.DispatchAt
+	} else {
+		job.RetryAfter = now
+	}
 	job.Status = "pending"
 
 	switch q.Backend {
 	case "memory":
 		if job.Queue == "" {
 			job.Queue = q.QueueChannelDefault
+		}
+		if job.DispatchAt != "" {
+			when, err := time.Parse(queueTimeFormat, job.DispatchAt)
+			if err != nil {
+				return "", fmt.Errorf("queue: invalid DispatchAt %q: %w", job.DispatchAt, err)
+			}
+			delay := time.Until(when)
+			if delay > 0 {
+				// Detached send so a future-scheduled job does not block the
+				// caller or stall other dispatchers on the unbuffered channel.
+				go func(j Job, d time.Duration) {
+					time.Sleep(d)
+					q.Jobs <- j
+				}(job, delay)
+				return job.ID, nil
+			}
 		}
 		q.Jobs <- job
 		return job.ID, nil
@@ -391,6 +435,16 @@ func (q *Queue) Dispatch(job Job) (string, error) {
 	}
 
 	return "", errors.New("unknown queue backend configuration")
+}
+
+// DispatchIn schedules a job to run no sooner than `delay` from now.
+// Equivalent to setting Job.DispatchAt = now+delay (RFC3339) and calling
+// Dispatch. A non-positive delay falls through to immediate dispatch.
+func (q *Queue) DispatchIn(job Job, delay time.Duration) (string, error) {
+	if delay > 0 {
+		job.DispatchAt = time.Now().UTC().Add(delay).Format(queueTimeFormat)
+	}
+	return q.Dispatch(job)
 }
 
 // UnmarshalPayload unmarshals a job from redis into a Job value suitable for

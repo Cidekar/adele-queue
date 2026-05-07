@@ -132,6 +132,21 @@ id, err := q.Dispatch(api.Job{
 
 `Dispatch` returns the generated UUID for the job. On the memory backend the job is pushed onto the channel synchronously and picked up by the next available worker; on the redis backend the job is persisted as a pending hash and picked up on the next scan cycle.
 
+### Scheduled Dispatch
+
+A job may be deferred to a future moment by setting `Job.DispatchAt` to an RFC3339 UTC timestamp, or by calling the convenience helper `Queue.DispatchIn(job, delay)`. A zero/empty `DispatchAt` and a non-positive `delay` both preserve immediate-dispatch behavior.
+
+The redis backend honors the deferral by seeding `RetryAfter` so the scanner gates the job until the target time. The memory backend defers via a detached goroutine that wakes when the schedule is due. RFC3339 has second resolution, so sub-second offsets may round down to "now" and run immediately.
+
+A common use is honoring upstream rate-limit `Retry-After` hints:
+
+```go
+if rl, ok := errAsRateLimited(err); ok {
+    q.DispatchIn(api.Job{Name: "ProcessJob", Payload: pb}, rl.RetryAfter)
+    return nil
+}
+```
+
 ## Retry and Failure Behavior
 
 A job participates in retry only when `Job.Retry` is `true`. When a handler returns an error:
