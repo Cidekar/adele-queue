@@ -60,10 +60,13 @@ func (q *Queue) addFailedJob(job Job, workerID int) {
 		job.RetryCounter++
 		// Re-enqueue from a detached goroutine so the worker is not blocked
 		// holding the FailedJobs mutex and sending to an unbuffered channel
-		// that only the worker itself drains.
+		// that only the worker itself drains. The retry is a new pending
+		// job from Depth()'s perspective; increment before the send so the
+		// counter cannot underflow when the worker decrements after running.
 		retryJob := job
 		go func() {
 			time.Sleep(delay)
+			q.pendingCount.Add(1)
 			q.Jobs <- retryJob
 		}()
 		return
