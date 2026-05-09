@@ -1,14 +1,27 @@
 package api
 
 import (
+	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cidekar/adele-framework/cache"
 	"github.com/gomodule/redigo/redis"
 	up "github.com/upper/db/v4"
 )
+
+// registeredHandler carries both the legacy and context-aware handler shapes
+// for a single job name. Exactly one of plain or ctx is non-nil for any given
+// registration; the worker dispatch path branches on which is set. Modeling
+// both in a single struct keeps the registry a single source of truth so the
+// double-registration guard in RegisterHandler / RegisterHandlerCtx can reject
+// a name regardless of which shape is being added.
+type registeredHandler struct {
+	plain func(payload interface{}) error
+	ctx   func(ctx context.Context, payload interface{}) error
+}
 
 // Configuration holds the queue server configuration loaded from queue.yml.
 //
@@ -60,11 +73,25 @@ type Queue struct {
 	// handlers is an in-process, name-keyed registry of handler functions.
 	// Used by the redis backend, which cannot serialize the Job.Handler func
 	// pointer. Not persisted; populated at application bootstrap via
-	// RegisterHandler.
+	// RegisterHandler or RegisterHandlerCtx. Each entry holds exactly one
+	// shape (plain or ctx); the worker dispatch path branches on which is
+	// set.
 	handlers struct {
 		mu sync.RWMutex
-		m  map[string]func(payload interface{}) error
+		m  map[string]registeredHandler
 	}
+	// pendingCount tracks the number of memory-backend jobs that have been
+	// Dispatched but not yet fully processed by a worker. Incremented on the
+	// successful send into q.Jobs; decremented after the handler returns
+	// (success or failure). Used by Depth() because q.Jobs is unbuffered, so
+	// len(q.Jobs) is always 0 and cannot be used as a backpressure signal.
+	// Not used by the redis backend, which derives Depth from a SCAN.
+	pendingCount atomic.Int64
+	// lifecycleCtx is cancelled when Close is called so context-aware
+	// handlers can short-circuit long downstream calls instead of running
+	// to completion against a torn-down queue. Initialized in buildQueue.
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 }
 
 // Redis holds the redis connection pool and keyspace-scan settings used by the

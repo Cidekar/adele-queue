@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -127,9 +128,14 @@ func buildQueue(a *adele.Adele, cfg Configuration) *Queue {
 	q.FailedJobs.data = make([]string, 0, q.HighWaterMark)
 
 	// Initialize the name-keyed handler registry. Consumers populate this at
-	// bootstrap via RegisterHandler; the redis backend looks up handlers here
-	// because Job.Handler cannot survive redis serialization.
-	q.handlers.m = make(map[string]func(payload interface{}) error)
+	// bootstrap via RegisterHandler or RegisterHandlerCtx; the redis backend
+	// looks up handlers here because Job.Handler cannot survive redis
+	// serialization.
+	q.handlers.m = make(map[string]registeredHandler)
+
+	// Initialize the queue lifecycle context. Cancelled by Close so any
+	// in-flight context-aware handlers can observe shutdown via ctx.Done().
+	q.lifecycleCtx, q.lifecycleCancel = context.WithCancel(context.Background())
 
 	// Guarantee the default channel is present in the configured channel list.
 	if !slices.Contains(q.QueueChannels, q.QueueChannelDefault) {
@@ -223,7 +229,19 @@ func loadConfig(a *adele.Adele) (*Configuration, error) {
 // it and waits for workers to complete before returning. When called with a
 // non-nil waitgroup (redis backend shutdown case) it signals Done on behalf of
 // the caller.
+//
+// Close also cancels the queue lifecycle context, which is the context passed
+// to handlers registered via RegisterHandlerCtx. Context-aware handlers that
+// honor ctx.Done() can therefore unblock immediately on shutdown instead of
+// running to completion against a torn-down system.
 func (q *Queue) Close(mWG *sync.WaitGroup) {
+	// Signal lifecycle shutdown to context-aware handlers as the very first
+	// step so any in-flight handler observing ctx.Done() can begin to unwind
+	// before the worker drain logic below starts waiting for it.
+	if q.lifecycleCancel != nil {
+		q.lifecycleCancel()
+	}
+
 	if q.Backend == "redis" {
 		if mWG != nil {
 			defer mWG.Done()
@@ -301,10 +319,18 @@ func (q *Queue) worker(id int, jobChannel chan Job, wg *sync.WaitGroup) {
 
 	if q.Backend == "memory" {
 		for job := range jobChannel {
-			// Skip jobs that did not register a handler
-			if job.Handler != nil {
+			// A job is runnable if it ships a Job.Handler inline OR has a
+			// matching entry (plain or ctx) in the registry. The registry
+			// path is the only way to surface ctx-aware handlers, since
+			// Job.Handler is the legacy plain shape.
+			if job.Handler != nil || q.hasRegisteredHandler(job.Name) {
 				q.runHandler(job, id)
 			}
+			// Decrement after the handler returns (success, failure, or
+			// skipped-no-handler). This mirrors the redis backend's
+			// :pending:* keyspace, which is removed only once a job moves
+			// out of the pending state.
+			q.pendingCount.Add(-1)
 		}
 	}
 
@@ -316,9 +342,30 @@ func (q *Queue) worker(id int, jobChannel chan Job, wg *sync.WaitGroup) {
 	}
 }
 
+// hasRegisteredHandler reports whether a non-empty registry entry exists
+// for the given job name. Used by the memory worker loop to admit jobs
+// that rely on registry dispatch (notably ctx-aware handlers, which are
+// only reachable through the registry).
+func (q *Queue) hasRegisteredHandler(name string) bool {
+	q.handlers.mu.RLock()
+	defer q.handlers.mu.RUnlock()
+	reg, ok := q.handlers.m[name]
+	if !ok {
+		return false
+	}
+	return reg.plain != nil || reg.ctx != nil
+}
+
 // runHandler invokes a job's handler with panic recovery so a single bad
 // job cannot crash the worker goroutine. A recovered panic is recorded as
 // a failure on the job's exception field.
+//
+// The memory backend stores handlers directly on Job.Handler (the legacy
+// plain shape). When a job name has also been registered via
+// RegisterHandlerCtx, the registered ctx variant takes precedence and is
+// invoked with the queue lifecycle context so it can short-circuit on
+// shutdown. Per-job timeouts are the consumer's responsibility via
+// context.WithTimeout inside the handler.
 func (q *Queue) runHandler(job Job, id int) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -326,8 +373,30 @@ func (q *Queue) runHandler(job Job, id int) {
 			q.addFailedJob(job, id)
 		}
 	}()
-	if err := job.Handler(job.Payload); err != nil {
-		job.Exception = err.Error()
+
+	var handlerErr error
+
+	// Prefer a context-aware registration when one exists for this job
+	// name. Falling back to the plain registry (or to Job.Handler in the
+	// memory dispatch path) preserves existing behavior for handlers that
+	// have not opted in.
+	q.handlers.mu.RLock()
+	reg, ok := q.handlers.m[job.Name]
+	q.handlers.mu.RUnlock()
+
+	switch {
+	case ok && reg.ctx != nil:
+		handlerErr = reg.ctx(q.lifecycleCtx, job.Payload)
+	case ok && reg.plain != nil:
+		handlerErr = reg.plain(job.Payload)
+	default:
+		// No registry entry: fall back to the inline Job.Handler set on
+		// the dispatched job. This is the historical memory-backend path.
+		handlerErr = job.Handler(job.Payload)
+	}
+
+	if handlerErr != nil {
+		job.Exception = handlerErr.Error()
 		q.addFailedJob(job, id)
 		return
 	}
@@ -338,11 +407,15 @@ func (q *Queue) runHandler(job Job, id int) {
 // dispatch registry used by the redis backend. Consumers call this at
 // application bootstrap, once per unique Job.Name they will dispatch.
 //
-// The memory backend does not use the registry — it invokes Job.Handler
-// directly — so registration is only required when the redis backend is
-// active. Registering defensively in both cases is safe and recommended.
+// The memory backend does not use the registry for jobs that ship a
+// Job.Handler inline; for those, registration is only required when the
+// redis backend is active. Registering defensively in both cases is safe
+// and recommended. When a name is registered, the registry takes precedence
+// over Job.Handler in the memory dispatch path as well.
 //
-// Returns an error on empty name, nil fn, or duplicate registration.
+// Returns an error on empty name, nil fn, or duplicate registration. A name
+// previously registered via RegisterHandlerCtx is also rejected so the
+// registry remains a single source of truth (one handler per name).
 //
 // Example:
 //
@@ -357,12 +430,40 @@ func (q *Queue) RegisterHandler(name string, fn func(payload interface{}) error)
 	q.handlers.mu.Lock()
 	defer q.handlers.mu.Unlock()
 	if q.handlers.m == nil {
-		q.handlers.m = make(map[string]func(payload interface{}) error)
+		q.handlers.m = make(map[string]registeredHandler)
 	}
 	if _, exists := q.handlers.m[name]; exists {
 		return fmt.Errorf("queue: handler %q already registered", name)
 	}
-	q.handlers.m[name] = fn
+	q.handlers.m[name] = registeredHandler{plain: fn}
+	return nil
+}
+
+// RegisterHandlerCtx is the context-aware variant of RegisterHandler. The
+// handler receives a context that is cancelled when the queue is shutting
+// down (Close called), so handlers can short-circuit long downstream calls
+// instead of running to completion against a torn-down system.
+//
+// Per-job timeouts can be applied via context.WithTimeout inside the handler.
+//
+// Both RegisterHandler and RegisterHandlerCtx may coexist on the same Queue;
+// each name registers exactly one handler regardless of which method was used.
+func (q *Queue) RegisterHandlerCtx(name string, fn func(ctx context.Context, payload interface{}) error) error {
+	if name == "" {
+		return fmt.Errorf("queue: RegisterHandlerCtx requires a non-empty name")
+	}
+	if fn == nil {
+		return fmt.Errorf("queue: RegisterHandlerCtx requires a non-nil function for %q", name)
+	}
+	q.handlers.mu.Lock()
+	defer q.handlers.mu.Unlock()
+	if q.handlers.m == nil {
+		q.handlers.m = make(map[string]registeredHandler)
+	}
+	if _, exists := q.handlers.m[name]; exists {
+		return fmt.Errorf("queue: handler %q already registered", name)
+	}
+	q.handlers.m[name] = registeredHandler{ctx: fn}
 	return nil
 }
 
@@ -397,13 +498,19 @@ func (q *Queue) Dispatch(job Job) (string, error) {
 			if delay > 0 {
 				// Detached send so a future-scheduled job does not block the
 				// caller or stall other dispatchers on the unbuffered channel.
+				// pendingCount is incremented just before the send — Depth()
+				// must observe the job as pending the moment a worker can
+				// receive it, otherwise the worker's post-handler decrement
+				// could race the increment and drive the count negative.
 				go func(j Job, d time.Duration) {
 					time.Sleep(d)
+					q.pendingCount.Add(1)
 					q.Jobs <- j
 				}(job, delay)
 				return job.ID, nil
 			}
 		}
+		q.pendingCount.Add(1)
 		q.Jobs <- job
 		return job.ID, nil
 
@@ -445,6 +552,81 @@ func (q *Queue) DispatchIn(job Job, delay time.Duration) (string, error) {
 		job.DispatchAt = time.Now().UTC().Add(delay).Format(queueTimeFormat)
 	}
 	return q.Dispatch(job)
+}
+
+// Depth returns the total number of jobs in pending state across every
+// configured QueueChannel. Used by consumers that want to gate dispatch on
+// queue backpressure (return 503 + Retry-After when the worker pool is
+// over a high-water mark).
+//
+// For the memory backend, returns the count of jobs that have been
+// Dispatched but not yet fully processed by a worker (incremented on
+// Dispatch, decremented after the handler returns). The Jobs channel is
+// unbuffered, so len(q.Jobs) cannot be used as a backpressure signal —
+// the queue maintains an atomic counter instead.
+//
+// For the redis backend, SCANs queues:<channel>:pending:* across every
+// channel in q.QueueChannels. The SCAN is cursor-based and bounded; on a
+// healthy queue the call returns in single-digit milliseconds.
+//
+// Returns an error if the redis pool is unavailable or the SCAN itself
+// errors. Safe to call concurrently with Dispatch and Listen.
+//
+// Note: the redis match pattern is built from the literal "queues:" prefix
+// used by formatPending. q.Redis.Prefix is not currently woven into the
+// pending-key format strings; if that wiring changes in the future, this
+// method must follow.
+func (q *Queue) Depth() (int, error) {
+	switch q.Backend {
+	case "memory":
+		return int(q.pendingCount.Load()), nil
+
+	case "redis":
+		if q.Redis.Pool == nil {
+			return 0, errors.New("queue: redis pool is unavailable")
+		}
+
+		conn := q.Redis.Pool.Get()
+		defer conn.Close()
+
+		if err := conn.Err(); err != nil {
+			return 0, fmt.Errorf("queue: redis connection unavailable: %w", err)
+		}
+
+		total := 0
+		for _, channel := range q.QueueChannels {
+			match := fmt.Sprintf("queues:%s:pending:*", channel)
+			cursor := "0"
+			for {
+				reply, err := redis.Values(conn.Do("SCAN", cursor, "MATCH", match, "COUNT", 100))
+				if err != nil {
+					return 0, fmt.Errorf("queue: redis SCAN failed for channel %q: %w", channel, err)
+				}
+				if len(reply) != 2 {
+					return 0, fmt.Errorf("queue: unexpected SCAN reply shape for channel %q", channel)
+				}
+
+				nextCursor, err := redis.String(reply[0], nil)
+				if err != nil {
+					return 0, fmt.Errorf("queue: parse SCAN cursor for channel %q: %w", channel, err)
+				}
+				keys, err := redis.Strings(reply[1], nil)
+				if err != nil {
+					return 0, fmt.Errorf("queue: parse SCAN keys for channel %q: %w", channel, err)
+				}
+
+				total += len(keys)
+
+				if nextCursor == "0" {
+					break
+				}
+				cursor = nextCursor
+			}
+		}
+		return total, nil
+	}
+
+	return 0, errors.New("queue: unknown backend")
 }
 
 // UnmarshalPayload unmarshals a job from redis into a Job value suitable for

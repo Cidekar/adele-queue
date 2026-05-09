@@ -183,14 +183,17 @@ func (q *Queue) handleRedisJob(queue string, cachedJob Job, jobID string, c redi
 	// Look up the handler by job name. Job.Handler (a func pointer) is tagged
 	// redis:"-" so it cannot survive serialization — the only way to invoke
 	// the handler from the redis path is via this in-process registry,
-	// populated at application bootstrap by calls to RegisterHandler.
+	// populated at application bootstrap by calls to RegisterHandler or
+	// RegisterHandlerCtx. Each entry holds exactly one shape; we branch on
+	// which is set and pass the queue lifecycle context to ctx-handlers so
+	// they can short-circuit on shutdown.
 	q.handlers.mu.RLock()
-	fn := q.handlers.m[cachedJob.Name]
+	reg, ok := q.handlers.m[cachedJob.Name]
 	q.handlers.mu.RUnlock()
 
 	var res int
 	var rpcError error
-	if fn == nil {
+	if !ok || (reg.plain == nil && reg.ctx == nil) {
 		// No handler registered for this job name. Skip retries and route
 		// straight through the permanent-failure branch with a clear
 		// Exception — retries would only defer the same failure.
@@ -205,8 +208,14 @@ func (q *Queue) handleRedisJob(queue string, cachedJob Job, jobID string, c redi
 					res = 1
 				}
 			}()
-			if err := fn(cachedJob.Payload); err != nil {
-				rpcError = err
+			var handlerErr error
+			if reg.ctx != nil {
+				handlerErr = reg.ctx(q.lifecycleCtx, cachedJob.Payload)
+			} else {
+				handlerErr = reg.plain(cachedJob.Payload)
+			}
+			if handlerErr != nil {
+				rpcError = handlerErr
 				res = 1
 			}
 		}()
