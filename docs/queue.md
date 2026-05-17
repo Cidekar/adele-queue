@@ -265,8 +265,103 @@ Let's pretend our music app is doing well enough that we need to ship a new rele
 
 The queue does not install shutdown hooks. Applications are expected to call `Close` during graceful termination (for example, from the same `signal.Notify` handler that shuts down the HTTP server).
 
+```mermaid
+flowchart TD
+    Boot["provider Boot → Listen()"] --> Fan["wg.Add per goroutine"]
+    Fan --> W1["worker 1"]
+    Fan --> Wn["worker N"]
+    Fan -->|redis only| Reaper["stale-lock reaper"]
+
+    W1 -.tracked by package wg.-> WG(("shared wg"))
+    Wn -.-> WG
+    Reaper -.-> WG
+
+    Close["Close(*sync.WaitGroup)"] --> Cancel["lifecycleCancel() —<br/>ctx.Done() to handlers"]
+    Cancel --> Branch{"Backend?"}
+
+    Branch -->|memory| MClose["close(q.Jobs)<br/>no new dispatches"]
+    MClose --> MDrain["wg.Wait()<br/>workers drain channel"]
+
+    Branch -->|redis| RFlag["systemShutdown = true<br/>scanner + reaper observe<br/>on next iteration"]
+    RFlag --> RDrain{"wg.Wait()<br/>vs timeout"}
+    RDrain -->|drained| RDone["clean shutdown"]
+    RDrain -->|"after reaper_interval + 5s"| RTimeout["log: shutdown timeout;<br/>goroutines may still run"]
+
+    MDrain --> Done["Close returns<br/>(mWG.Done() if passed)"]
+    RDone --> Done
+    RTimeout --> Done
+```
+
+The diagram makes the asymmetry explicit: the reaper goroutine only exists on the redis backend, and the two backends drain differently — memory closes the channel and waits unbounded for workers to finish what they picked up, while redis flips a process-wide flag and bounds the wait at `reaper_interval + 5s` so a worker hung on redis I/O can't stall shutdown forever. In both cases `lifecycleCancel()` fires *first*, so context-aware handlers start unwinding before the drain wait begins.
+
 ## Database Schema
 
 Let's pretend it's Monday morning and someone asks why a particular user's playlist never got its updated artwork last Friday. The in-memory failure cache is long gone — the process has restarted twice since then — so "check the logs" only gets you so far. This is why the queue writes jobs to disk: so that days later you can still answer "did this job run, and did it fail?" with a SQL query instead of a guess.
 
-The queue persists completed and failed jobs to two Postgres tables defined in `migrations/queue_tables.postgres.sql`. Run that migration against your database before dispatching jobs with a DB-backed workflow. Both tables include a `trigger_set_timestamp` trigger that keeps `updated_at` current, and an index on `job_id` for lookup by the UUID returned from `Dispatch`.
+The queue persists completed and failed jobs to two Postgres tables defined in `migrations/queue_tables.postgres.sql`. Run that migration against your database before dispatching jobs with a DB-backed workflow. Both tables include a `trigger_set_timestamp` trigger that keeps `updated_at` current, plus indexes on `job_id` (lookup by the UUID returned from `Dispatch`) and `name` (lookup by job name).
+
+```sql
+-- Keeps updated_at current on every UPDATE; shared by both tables.
+CREATE OR REPLACE FUNCTION trigger_set_timestamp()
+RETURNS TRIGGER AS
+$$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$
+LANGUAGE plpgsql;
+
+-- Completed jobs. `payload` is the marshaled bytes the job was dispatched
+-- with, stored as TEXT; `attempts` is the final RetryCounter value.
+CREATE TABLE jobs (
+    id SERIAL PRIMARY KEY,
+    job_id UUID NOT NULL,
+    payload TEXT,
+    attempts INT,
+    name TEXT,
+    reserved_at TIMESTAMP WITHOUT TIME ZONE,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_jobs_job_id ON jobs (job_id);
+CREATE INDEX idx_jobs_name ON jobs (name);
+
+CREATE TRIGGER set_timestamp_jobs
+BEFORE UPDATE ON jobs
+FOR EACH ROW
+EXECUTE PROCEDURE trigger_set_timestamp();
+
+-- Jobs that exhausted MaxAttempts. `exception` holds the last handler error
+-- (or "lock expired after Xs" when the reaper permafailed it).
+CREATE TABLE failed_jobs (
+    id SERIAL PRIMARY KEY,
+    job_id UUID NOT NULL,
+    name TEXT,
+    attempts INT,
+    payload TEXT,
+    exception TEXT,
+    created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT now(),
+    updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_failed_jobs_job_id ON failed_jobs (job_id);
+CREATE INDEX idx_failed_jobs_name ON failed_jobs (name);
+
+CREATE TRIGGER set_timestamp_failed_jobs
+BEFORE UPDATE ON failed_jobs
+FOR EACH ROW
+EXECUTE PROCEDURE trigger_set_timestamp();
+```
+
+Tying it back to Monday morning: the `failed_jobs` row is how you answer "did this job run, and did it fail?" days later. Look it up by the UUID `Dispatch` returned, or sweep by `name` for every failure of one job type:
+
+```sql
+-- Why did last Friday's artwork job for this playlist fail?
+SELECT job_id, attempts, exception, created_at
+FROM failed_jobs
+WHERE name = 'AddTrackToPlaylist'
+  AND created_at >= '2026-05-15'
+ORDER BY created_at DESC;
+```
