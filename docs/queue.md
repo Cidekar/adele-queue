@@ -98,6 +98,10 @@ id, err := q.Dispatch(api.Job{
 
 ## Dispatching a Job
 
+Let's pretend we're building the backend for a music app — something like a stripped-down Spotify. Users browse tracks, build playlists, and share them with friends. We're going to follow one feature through this section: the "Add to playlist" button.
+
+It sounds trivial. The user taps a button, a song lands in a playlist, done. But behind that one tap is a pile of work that nobody wants to wait for, and some of it likes to fail. So before we touch any code, let's be honest about what actually has to happen the instant that button is tapped — and what can wait.
+
 When a user taps "Add to playlist," only one thing has to happen before you can return a response: the track has to be recorded in the playlist. Everything *else* that adding a track triggers — re-rendering the playlist artwork, notifying collaborators, recomputing recommendations, syncing the change to the CDN — is slow, can fail transiently, and has no business blocking the HTTP request. That work belongs on a queue.
 
 This section walks one scenario end to end: adding a track to a playlist. You'll define the work, register it, dispatch it, let it retry on failure, and finally schedule it for a future moment.
@@ -131,9 +135,16 @@ func AddTrackToPlaylist(payload interface{}) error {
         return err
     }
 
-    // Idempotent by design: adding a track that's already present is a no-op.
-    // That's what makes this job safe to retry (see Retry below).
-    return renderArtworkNotifyCollaboratorsAndSyncCDN(p)
+    // Re-rendering the cover art is the slow part. Adding the same track
+    // twice just regenerates the same image, so a retry can't hurt us
+    // (see Retry below).
+    if err := renderPlaylistArtwork(p.PlaylistID); err != nil {
+        return err
+    }
+    if err := notifyCollaborators(p.PlaylistID, p.AddedBy); err != nil {
+        return err
+    }
+    return syncToCDN(p.PlaylistID)
 }
 ```
 
@@ -233,6 +244,10 @@ if rl, ok := errAsRateLimited(err); ok {
 
 ## Retry and Failure Behavior
 
+Let's pretend a track push failed and our user's "Add to playlist" tap didn't take. The track made it into the playlist — that part is synchronous and already committed — but the background job that re-renders the cover art and syncs the new state to the CDN choked. Maybe the CDN had a hiccup, maybe the artwork renderer timed out. Either way, the job's handler returned an error, and now the playlist's friends are looking at stale cover art.
+
+This is exactly the situation retry exists for. Because `AddTrackToPlaylist` is idempotent, the queue can just run it again — re-rendering the same artwork and re-syncing produces the same result, so a second (or third) attempt costs us nothing but a little time. Here's what happens under the hood when that handler returns an error.
+
 A job participates in retry only when `Job.Retry` is `true`. When a handler returns an error:
 
 1. The queue increments `RetryCounter`.
@@ -243,11 +258,15 @@ Callers can introspect failures via `Queue.GetFailedJobsFromMemory()` (recent id
 
 ## Worker Lifecycle
 
+Let's pretend our music app is doing well enough that we need to ship a new release in the middle of the afternoon. People are actively building playlists right now, which means there are artwork-render and CDN-sync jobs in flight at the exact moment we redeploy. Kill the process the wrong way and those half-finished jobs vanish — a user's playlist ends up with the new track but stale cover art, and nothing ever fixes it. So the question isn't just "how do workers start," it's "how do they stop without dropping work on the floor."
+
 - `Listen()` — starts `WorkerCount` goroutines; called automatically by the provider's `Boot`. When the redis backend is active, it also starts the stale-lock reaper goroutine, tracked by the same package-level `wg` as workers so `Close()` drains both together.
 - `Close(*sync.WaitGroup)` — stops new dispatches and waits for in-flight jobs to drain. Pass a non-nil `WaitGroup` when orchestrating shutdown across multiple subsystems; the queue will call `Done()` on your behalf. Closing the memory backend closes the jobs channel; closing the redis backend flips a process-wide shutdown flag that the scanner and reaper observe on their next iteration, then waits up to `reaper_interval + 5s` for goroutines to exit.
 
 The queue does not install shutdown hooks. Applications are expected to call `Close` during graceful termination (for example, from the same `signal.Notify` handler that shuts down the HTTP server).
 
 ## Database Schema
+
+Let's pretend it's Monday morning and someone asks why a particular user's playlist never got its updated artwork last Friday. The in-memory failure cache is long gone — the process has restarted twice since then — so "check the logs" only gets you so far. This is why the queue writes jobs to disk: so that days later you can still answer "did this job run, and did it fail?" with a SQL query instead of a guess.
 
 The queue persists completed and failed jobs to two Postgres tables defined in `migrations/queue_tables.postgres.sql`. Run that migration against your database before dispatching jobs with a DB-backed workflow. Both tables include a `trigger_set_timestamp` trigger that keeps `updated_at` current, and an index on `job_id` for lookup by the UUID returned from `Dispatch`.
