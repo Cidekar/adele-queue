@@ -73,13 +73,12 @@ When the redis backend is active, a dedicated goroutine scans `queues:*:locked:*
 Set `Job.LockFor` (seconds) when a job is known to take longer than the queue default:
 
 ```go
-job := api.Job{
+id, err := q.Dispatch(api.Job{
     Name:    "nightly-export",
-    Payload: payload,
+    Payload: body, // json.Marshal of the export's parameters
     Retry:   true,
     LockFor: 14 * 3600, // 14 hours; beats the 300s queue default
-}
-queue.Dispatch(job)
+})
 ```
 
 `LockFor` is persisted on the redis hash and survives restarts. The reaper respects it on every scan. Leave `LockFor` unset (zero) to use `lock_timeout`. There is no upper bound — a day-long `LockFor` is valid.
@@ -99,50 +98,135 @@ queue.Dispatch(job)
 
 ## Dispatching a Job
 
+When a user taps "Add to playlist," only one thing has to happen before you can return a response: the track has to be recorded in the playlist. Everything *else* that adding a track triggers — re-rendering the playlist artwork, notifying collaborators, recomputing recommendations, syncing the change to the CDN — is slow, can fail transiently, and has no business blocking the HTTP request. That work belongs on a queue.
+
+This section walks one scenario end to end: adding a track to a playlist. You'll define the work, register it, dispatch it, let it retry on failure, and finally schedule it for a future moment.
+
+### Define the payload and the handler
+
+A job carries its input as a marshaled byte slice, not as a Go value. `Job.Payload` is a `[]byte`, and your handler receives that same `[]byte` — *not* the struct you started with. Marshal on the way in, unmarshal on the way out. This is the single most common mistake: a type assertion like `payload.(AddTrackPayload)` will panic, because the value is always bytes.
+
 ```go
+package playlist
+
 import (
-    "github.com/cidekar/adele-queue"
+    "encoding/json"
+
     "github.com/cidekar/adele-queue/api"
 )
 
-type EmailPayload struct {
-    To      string
-    Subject string
-    Body    string
+// AddTrackPayload is the input to the AddTrackToPlaylist job. Keep it small:
+// identifiers, not whole objects. The handler re-loads anything it needs.
+type AddTrackPayload struct {
+    PlaylistID string `json:"playlistId"`
+    TrackID    string `json:"trackId"`
+    AddedBy    string `json:"addedBy"`
 }
 
-func SendEmail(payload interface{}) error {
-    p := payload.(EmailPayload)
-    // ... send the email
-    return nil
+// AddTrackToPlaylist is the unit of work. It receives the marshaled payload
+// the job was dispatched with and is responsible for unmarshaling it.
+func AddTrackToPlaylist(payload interface{}) error {
+    var p AddTrackPayload
+    if err := json.Unmarshal(payload.([]byte), &p); err != nil {
+        return err
+    }
+
+    // Idempotent by design: adding a track that's already present is a no-op.
+    // That's what makes this job safe to retry (see Retry below).
+    return renderArtworkNotifyCollaboratorsAndSyncCDN(p)
+}
+```
+
+### Register the handler
+
+Bind the handler to a job *name* once, at application bootstrap. Name-based registration is the portable path: it works on both backends, and it's the *only* way the redis backend can find your handler — a redis-backed job is delivered to the worker as bytes over RPC, so a function pointer set on the job can't survive the trip.
+
+```go
+q, err := queue.New(app)
+if err != nil {
+    return err
 }
 
-// Construct a queue directly (the ServiceProvider also maintains one
-// accessible via *queue.ServiceProvider.Service()).
-q := queue.New(app)
+// Register once per unique job name, before any dispatch.
+if err := q.RegisterHandler("AddTrackToPlaylist", playlist.AddTrackToPlaylist); err != nil {
+    return err
+}
+```
+
+> **Memory-backend shortcut.** On the memory backend you may instead set `Job.Handler` inline on the dispatched job and skip registration. It's convenient for single-process apps and tests, but it does *not* work on the redis backend, and a registered handler always takes precedence over an inline one. Prefer `RegisterHandler` so the same code works unchanged when you switch backends.
+
+### Dispatch the job
+
+With the handler registered, the HTTP handler's job is small: marshal the payload, dispatch, return. The slow work now happens on a worker.
+
+```go
+body, err := json.Marshal(playlist.AddTrackPayload{
+    PlaylistID: playlistID,
+    TrackID:    trackID,
+    AddedBy:    userID,
+})
+if err != nil {
+    return err
+}
 
 id, err := q.Dispatch(api.Job{
-    Name:           "SendEmail",
-    Handler:        SendEmail,
-    Queue:          "email",
+    Name:    "AddTrackToPlaylist",
+    Payload: body,
+    Queue:   "playlist",
+})
+```
+
+`Dispatch` returns the job's generated UUID (`string`) and an error. On the memory backend the job is pushed onto the channel and picked up by the next available worker; on the redis backend it's persisted as a pending hash and picked up on the next scan cycle. Either way the call returns immediately — the user gets their response while artwork re-renders in the background.
+
+### Retry on failure
+
+The CDN sync inside the handler is exactly the kind of step that fails for a few seconds and then recovers. Opt the job into retries and the queue will re-run it on a backoff instead of dropping it:
+
+```go
+id, err := q.Dispatch(api.Job{
+    Name:           "AddTrackToPlaylist",
+    Payload:        body,
+    Queue:          "playlist",
     Retry:          true,
     RetryInSeconds: 5,
 })
 ```
 
-`Dispatch` returns the generated UUID for the job. On the memory backend the job is pushed onto the channel synchronously and picked up by the next available worker; on the redis backend the job is persisted as a pending hash and picked up on the next scan cycle.
+A job retries only when `Job.Retry` is `true`. On failure the queue increments the attempt counter and re-queues with a backoff (`RetryInSeconds * attempt` on the memory backend; encoded in `RetryAfter` and enforced by the scanner on redis), up to `MaxAttempts`. This is safe here precisely because `AddTrackToPlaylist` is idempotent — a retried run that re-adds the same track changes nothing. Retry is only safe for handlers with that property; a handler that, say, charges a card needs an idempotency key before you turn `Retry` on. See [Retry and Failure Behavior](#retry-and-failure-behavior) for the full lifecycle.
 
 ### Scheduled Dispatch
 
-A job may be deferred to a future moment by setting `Job.DispatchAt` to an RFC3339 UTC timestamp, or by calling the convenience helper `Queue.DispatchIn(job, delay)`. A zero/empty `DispatchAt` and a non-positive `delay` both preserve immediate-dispatch behavior.
+Some work shouldn't run *now* — it should run *later*. Say the track is from an album that goes live at a specific time, and you want to publish it to followers' feeds exactly at release, not the moment it was added. Defer the job to a future instant in one of two ways:
 
-The redis backend honors the deferral by seeding `RetryAfter` so the scanner gates the job until the target time. The memory backend defers via a detached goroutine that wakes when the schedule is due. RFC3339 has second resolution, so sub-second offsets may round down to "now" and run immediately.
+```go
+// Form 1: helper — "run no sooner than 30 minutes from now."
+id, err := q.DispatchIn(api.Job{
+    Name:    "PublishTrackToFollowers",
+    Payload: body,
+    Queue:   "playlist",
+}, 30*time.Minute)
 
-A common use is honoring upstream rate-limit `Retry-After` hints:
+// Form 2: explicit timestamp — "run at the album's release time."
+id, err = q.Dispatch(api.Job{
+    Name:       "PublishTrackToFollowers",
+    Payload:    body,
+    Queue:      "playlist",
+    DispatchAt: albumReleaseUTC.Format(time.RFC3339),
+})
+```
+
+Both return `(string, error)` exactly like an immediate dispatch. `DispatchIn` is just `DispatchAt` with the timestamp computed for you; a non-positive delay or an empty `DispatchAt` falls straight through to immediate dispatch.
+
+The redis backend honors the deferral by seeding `RetryAfter` so the scanner gates the job until its time arrives. The memory backend defers via a detached goroutine that wakes when the schedule is due. Two caveats to keep in mind:
+
+- **`DispatchAt` must parse.** An unparseable timestamp makes `Dispatch` return an error rather than running the job early — always format with `time.RFC3339`.
+- **Second resolution.** RFC3339 carries no sub-second precision, so a sub-second offset rounds down to "now" and runs immediately. Schedule in seconds or longer.
+
+The same mechanism cleanly handles upstream rate limits — when a downstream API returns a `Retry-After`, re-dispatch the job to run after the hint instead of busy-waiting:
 
 ```go
 if rl, ok := errAsRateLimited(err); ok {
-    q.DispatchIn(api.Job{Name: "ProcessJob", Payload: pb}, rl.RetryAfter)
+    q.DispatchIn(api.Job{Name: "PublishTrackToFollowers", Payload: body}, rl.RetryAfter)
     return nil
 }
 ```
